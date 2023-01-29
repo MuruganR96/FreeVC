@@ -525,7 +525,7 @@ class SynthesizerTrn(nn.Module):
     if not self.use_spk:
       self.enc_spk = SpeakerEncoder(model_hidden_size=gin_channels, model_embedding_size=gin_channels)
 
-  def forward(self, c, spec, g=None, mel=None, c_lengths=None, spec_lengths=None):
+  def forward(self, c, spec, g=None, mel=None, p=None, c_lengths=None, spec_lengths=None):
 
     if c_lengths == None:
       c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
@@ -544,14 +544,16 @@ class SynthesizerTrn(nn.Module):
     o = self.dec(z_slice, g=g)
 
     if self.use_pitch:
+        p = p.unsqueeze(-1)
+
         z_p = self.variance_adaptor(
                     z_p,
-                    pitch_target=pitches_padded
+                    pitch_target=p
                 )
 
     return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
-  def infer(self, c, g=None, mel=None, c_lengths=None):
+  def infer(self, c, g=None, mel=None, p=p, c_lengths=None):
     if c_lengths == None:
       c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
     if not self.use_spk:
@@ -560,6 +562,15 @@ class SynthesizerTrn(nn.Module):
 
     z_p, m_p, logs_p, c_mask = self.enc_p(c, c_lengths)
     z = self.flow(z_p, c_mask, g=g, reverse=True)
+
+    if self.use_pitch:
+        p = p.unsqueeze(-1)
+
+        z = self.variance_adaptor(
+                    z,
+                    pitch_target=p
+                )
+
     o = self.dec(z * c_mask, g=g)
     
     return o

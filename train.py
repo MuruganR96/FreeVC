@@ -135,11 +135,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   net_d.train()
   for batch_idx, items in enumerate(train_loader):
     if hps.model.use_spk:
-      c, spec, y, spk = items
+      c, spec, y, spk, pitch = items
       g = spk.cuda(rank, non_blocking=True)
+      p = pitch.cuda(rank, non_blocking=True)
     else:
-      c, spec, y = items
+      c, spec, y, _, pitch = items
       g = None
+      p = pitch.cuda(rank, non_blocking=True)
+
     spec, y = spec.cuda(rank, non_blocking=True), y.cuda(rank, non_blocking=True)
     c = c.cuda(rank, non_blocking=True)
     mel = spec_to_mel_torch(
@@ -152,7 +155,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     with autocast(enabled=hps.train.fp16_run):
       y_hat, ids_slice, z_mask,\
-      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(c, spec, g=g, mel=mel)
+      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(c, spec, g=g, mel=mel, p=p)
       
       y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
       y_hat_mel = mel_spectrogram_torch(
@@ -235,11 +238,13 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     with torch.no_grad():
       for batch_idx, items in enumerate(eval_loader):
         if hps.model.use_spk:
-          c, spec, y, spk = items
+          c, spec, y, spk, pitch = items
           g = spk[:1].cuda(0)
+          p = pitch[:1].cuda(0)
         else:
-          c, spec, y = items
+          c, spec, y, _, pitch = items
           g = None
+          p = pitch[:1].cuda(0)
         spec, y = spec[:1].cuda(0), y[:1].cuda(0)
         c = c[:1].cuda(0)
         break
@@ -250,7 +255,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         hps.data.sampling_rate,
         hps.data.mel_fmin, 
         hps.data.mel_fmax)
-      y_hat = generator.module.infer(c, g=g, mel=mel)
+      y_hat = generator.module.infer(c, g=g, mel=mel, p=p)
       
       y_hat_mel = mel_spectrogram_torch(
         y_hat.squeeze(1).float(),
