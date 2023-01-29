@@ -29,6 +29,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.use_sr = hparams.train.use_sr
         self.use_spk = hparams.model.use_spk
         self.spec_len = hparams.train.max_speclen
+        self.use_pitch = hparams.model.use_pitch
+
+        self.n_mel_channels = hparams.data.n_mel_channels
+        self.mel_fmin = hparams.data.mel_fmin
+        self.mel_fmax = hparams.data.mel_fmax
 
         random.seed(1234)
         random.shuffle(self.audiopaths)
@@ -63,7 +68,14 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 center=False)
             spec = torch.squeeze(spec, 0)
             torch.save(spec, spec_filename)
-            
+        
+        if self.use_pitch:
+            pitch_filename = filename.replace(".wav", ".npy")
+            pitch_path = pitch_filename.replace("DUMMY", "dataset/pitch")
+            pitch = np.load(pitch_path)
+        else:
+            pitch = None
+
         if self.use_spk:
             spk_filename = filename.replace(".wav", ".npy")
             spk_filename = spk_filename.replace("DUMMY", "dataset/spk")
@@ -107,9 +119,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         '''
         
         if self.use_spk:
-            return c, spec, audio_norm, spk
+            return c, spec, audio_norm, spk, pitch
         else:
-            return c, spec, audio_norm
+            return c, spec, audio_norm, _, pitch
 
     def __getitem__(self, index):
         return self.get_audio(self.audiopaths[index][0])
@@ -125,6 +137,18 @@ class TextAudioSpeakerCollate():
         self.hps = hps
         self.use_sr = hps.train.use_sr
         self.use_spk = hps.model.use_spk
+
+    def pad_1D(self, inputs, PAD=0):
+        def pad_data(x, length, PAD):
+            x_padded = np.pad(
+                x, (0, length - x.shape[0]), mode="constant", constant_values=PAD
+            )
+            return x_padded
+
+        max_len = max((len(x) for x in inputs))
+        padded = np.stack([pad_data(x, max_len, PAD) for x in inputs])
+
+        return padded
 
     def __call__(self, batch):
         """Collate's training batch from normalized text, audio and speaker identities
@@ -146,7 +170,13 @@ class TextAudioSpeakerCollate():
             spks = torch.FloatTensor(len(batch), batch[0][3].size(0))
         else:
             spks = None
-        
+
+        if self.use_pitch:
+            pitches = batch[0][4]
+            pitches_padded =  torch.FloatTensor(pad_1D(pitches))
+        else:
+            pitches_padded = None
+
         c_padded = torch.FloatTensor(len(batch), batch[0][0].size(0), max_spec_len)
         spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
@@ -183,9 +213,9 @@ class TextAudioSpeakerCollate():
         wav_padded = wav_padded[:,:,:-self.hps.data.hop_length]
 
         if self.use_spk:
-          return c_padded, spec_padded, wav_padded, spks
+          return c_padded, spec_padded, wav_padded, spks, pitches_padded
         else:
-          return c_padded, spec_padded, wav_padded
+          return c_padded, spec_padded, wav_padded, _, pitches_padded
 
 
 class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):

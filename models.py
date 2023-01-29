@@ -11,6 +11,41 @@ from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 from commons import init_weights, get_padding
 
+pitch_config = {
+    "preprocessed_path": "./preprocessed_data/LibriTTS",
+
+    "preprocess_config" : {
+        "pitch": {
+            "feature": "frame_level", # support 'phoneme_level' or 'frame_level'
+            "normalization": True
+        }
+    },
+    "model_config": {
+        "transformer": {
+            "encoder_layer": 4
+            "encoder_head": 2
+            "encoder_hidden": 256
+            "decoder_layer": 6
+            "decoder_head": 2
+            "decoder_hidden": 256
+            "conv_filter_size": 1024
+            "conv_kernel_size": [9, 1]
+            "encoder_dropout": 0.2
+            "decoder_dropout": 0.2
+        }
+        "variance_embedding": {
+            "pitch_quantization": "linear",
+            "n_bins": 256
+        },
+        "variance_predictor": {
+            "filter_size": 256
+            "kernel_size": 3
+            "dropout": 0.5
+        }
+
+    }
+
+}
 
 class ResidualCouplingBlock(nn.Module):
   def __init__(self,
@@ -263,6 +298,174 @@ class SpeakerEncoder(torch.nn.Module):
         
         return embed
 
+class VarianceAdaptor(nn.Module):
+    """Variance Adaptor"""
+
+    def __init__(self):
+        super(VarianceAdaptor, self).__init__()
+        self.pitch_predictor = VariancePredictor()
+
+        self.pitch_feature_level = pitch_config["preprocess_config"]["pitch"]["feature"]
+
+        assert self.pitch_feature_level in ["phoneme_level", "frame_level"]
+
+        pitch_quantization = pitch_config["model_config"]["variance_embedding"]["pitch_quantization"]
+        
+        n_bins = pitch_config["model_config"]["variance_embedding"]["n_bins"]
+        assert pitch_quantization in ["linear", "log"]
+        
+        with open(
+            os.path.join(pitch_config["preprocessed_path"], "stats.json")
+        ) as f:
+            stats = json.load(f)
+            pitch_min, pitch_max = stats["pitch"][:2]
+
+        if pitch_quantization == "log":
+            self.pitch_bins = nn.Parameter(
+                torch.exp(
+                    torch.linspace(np.log(pitch_min), np.log(pitch_max), n_bins - 1)
+                ),
+                requires_grad=False,
+            )
+        else:
+            self.pitch_bins = nn.Parameter(
+                torch.linspace(pitch_min, pitch_max, n_bins - 1),
+                requires_grad=False,
+            )
+
+        self.pitch_embedding = nn.Embedding(
+            n_bins, pitch_config["model_config"]["transformer"]["encoder_hidden"]
+        )
+
+    def get_pitch_embedding(self, x, target, mask, control):
+        prediction = self.pitch_predictor(x, mask)
+        if target is not None:
+            embedding = self.pitch_embedding(torch.bucketize(target, self.pitch_bins))
+        else:
+            prediction = prediction * control
+            embedding = self.pitch_embedding(
+                torch.bucketize(prediction, self.pitch_bins)
+            )
+        return prediction, embedding
+
+    def forward(
+        self,
+        x,
+        mel_mask=None,
+        pitch_target=None,
+        p_control=1.0
+    ):
+
+        if self.pitch_feature_level == "frame_level":
+            pitch_prediction, pitch_embedding = self.get_pitch_embedding(
+                x, pitch_target, mel_mask, p_control
+            )
+            x = x + pitch_embedding
+
+        return (
+            x,
+            pitch_prediction
+        )
+
+class VariancePredictor(nn.Module):
+    """Duration, Pitch and Energy Predictor"""
+
+    def __init__(self):
+        super(VariancePredictor, self).__init__()
+
+        self.input_size = pitch_config["model_config"]["transformer"]["encoder_hidden"]
+        self.filter_size = pitch_config["model_config"]["variance_predictor"]["filter_size"]
+        self.kernel = pitch_config["model_config"]["variance_predictor"]["kernel_size"]
+        self.conv_output_size = pitch_config["model_config"]["variance_predictor"]["filter_size"]
+        self.dropout = pitch_config["model_config"]["variance_predictor"]["dropout"]
+
+        self.conv_layer = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "conv1d_1",
+                        Conv(
+                            self.input_size,
+                            self.filter_size,
+                            kernel_size=self.kernel,
+                            padding=(self.kernel - 1) // 2,
+                        ),
+                    ),
+                    ("relu_1", nn.ReLU()),
+                    ("layer_norm_1", nn.LayerNorm(self.filter_size)),
+                    ("dropout_1", nn.Dropout(self.dropout)),
+                    (
+                        "conv1d_2",
+                        Conv(
+                            self.filter_size,
+                            self.filter_size,
+                            kernel_size=self.kernel,
+                            padding=1,
+                        ),
+                    ),
+                    ("relu_2", nn.ReLU()),
+                    ("layer_norm_2", nn.LayerNorm(self.filter_size)),
+                    ("dropout_2", nn.Dropout(self.dropout)),
+                ]
+            )
+        )
+
+        self.linear_layer = nn.Linear(self.conv_output_size, 1)
+
+    def forward(self, encoder_output, mask):
+        out = self.conv_layer(encoder_output)
+        out = self.linear_layer(out)
+        out = out.squeeze(-1)
+
+        if mask is not None:
+            out = out.masked_fill(mask, 0.0)
+
+        return out
+
+class Conv(nn.Module):
+    """
+    Convolution Module
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+        w_init="linear",
+    ):
+        """
+        :param in_channels: dimension of input
+        :param out_channels: dimension of output
+        :param kernel_size: size of kernel
+        :param stride: size of stride
+        :param padding: size of padding
+        :param dilation: dilation rate
+        :param bias: boolean. if True, bias is included.
+        :param w_init: str. weight inits with xavier initialization.
+        """
+        super(Conv, self).__init__()
+
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+
+    def forward(self, x):
+        x = x.contiguous().transpose(1, 2)
+        x = self.conv(x)
+        x = x.contiguous().transpose(1, 2)
+
+        return x
 
 class SynthesizerTrn(nn.Module):
   """
@@ -288,6 +491,7 @@ class SynthesizerTrn(nn.Module):
     gin_channels,
     ssl_dim,
     use_spk,
+    use_pitch
     **kwargs):
 
     super().__init__()
@@ -309,16 +513,20 @@ class SynthesizerTrn(nn.Module):
     self.gin_channels = gin_channels
     self.ssl_dim = ssl_dim
     self.use_spk = use_spk
+    self.use_pitch = use_pitch
 
     self.enc_p = Encoder(ssl_dim, inter_channels, hidden_channels, 5, 1, 16)
     self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
     self.enc_q = Encoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels) 
     self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
     
+    self.variance_adaptor = VarianceAdaptor()
+
     if not self.use_spk:
       self.enc_spk = SpeakerEncoder(model_hidden_size=gin_channels, model_embedding_size=gin_channels)
 
   def forward(self, c, spec, g=None, mel=None, c_lengths=None, spec_lengths=None):
+
     if c_lengths == None:
       c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
     if spec_lengths == None:
@@ -334,7 +542,13 @@ class SynthesizerTrn(nn.Module):
 
     z_slice, ids_slice = commons.rand_slice_segments(z, spec_lengths, self.segment_size)
     o = self.dec(z_slice, g=g)
-    
+
+    if self.use_pitch:
+        z_p = self.variance_adaptor(
+                    z_p,
+                    pitch_target=pitches_padded
+                )
+
     return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
   def infer(self, c, g=None, mel=None, c_lengths=None):
